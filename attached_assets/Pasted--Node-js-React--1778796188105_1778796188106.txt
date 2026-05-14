@@ -1,0 +1,1734 @@
+أنت مهندس برمجيات خبير متخصص في Node.js وReact. مهمتك إنشاء تطبيق ويب كامل وجاهز للإنتاج لتحميل الوسائط من المنصات الاجتماعية. اتبع المواصفات التالية بدقة تامة دون أي اختصار أو تعديل.
+
+---
+
+## المتطلبات الكاملة
+
+**الخادم:**
+- Node.js v18+ مع Express
+- yt-dlp-exec (npm فقط، لا pip)
+- p-queue لإدارة التحميلات المتزامنة (حد أقصى 3)
+- node-fetch v3 لجلب الفيديوهات
+- تنظيف تلقائي لمجلد tmp كل ساعة
+- Health check endpoint كامل
+- Timeout لجميع العمليات (extract: 30s، download: 120s)
+- رسائل خطأ عربية مخصصة لكل حالة فشل
+
+**الأمان:**
+- helmet مع إعدادات مخصصة
+- CORS محدود بقائمة origins
+- Rate limiting: 10 طلبات/دقيقة لكل IP
+- قائمة بيضاء صارمة للنطاقات المسموحة
+- التحقق الكامل من hostname بـ endsWith (ليس includes)
+- تعقيم اسم الملف من أي أحرف خطرة
+- حجم body محدود بـ 2kb
+
+**الواجهة:**
+- React + Vite مع proxy للـ dev mode
+- RTL عربي كامل
+- Dark/Light mode مع حفظ في localStorage
+- سجل آخر 5 روابط مع عناوينها
+- Progress bar حقيقي مع نسبة مئوية
+- عرض: العنوان، الصورة المصغرة، المدة، القناة، المشاهدات، حجم الملف
+- Spinner أثناء الجلب
+- رسالة playlist واضحة
+- مؤشر حالة الخادم (نقطة خضراء)
+
+**البيئة:**
+- Replit-ready عبر Nix packages
+- Vite proxy يوجه /api للخادم في dev
+
+---
+
+## هيكل الملفات
+
+```
+media-downloader/
+├── package.json
+├── .env
+├── .replit
+├── server.js
+├── vite.config.js
+├── index.html
+└── src/
+    ├── main.jsx
+    ├── App.jsx
+    └── App.css
+```
+
+---
+
+## محتوى كل ملف — انسخ بدقة تامة
+
+---
+
+### 1. package.json
+
+```json
+{
+  "name": "media-downloader",
+  "version": "4.0.0",
+  "description": "تطبيق تحميل وسائط من المنصات الاجتماعية",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "vite build",
+    "start": "node server.js",
+    "preview": "npm run build && npm start"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.0",
+    "helmet": "^7.1.0",
+    "node-fetch": "^3.3.2",
+    "p-queue": "^8.0.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-icons": "^4.12.0",
+    "yt-dlp-exec": "^1.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.0",
+    "vite": "^5.0.0"
+  }
+}
+```
+
+---
+
+### 2. .env
+
+```env
+PORT=5000
+ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5000
+MAX_CONCURRENT_DOWNLOADS=3
+TMP_MAX_AGE_MINUTES=10
+NODE_ENV=production
+```
+
+---
+
+### 3. .replit
+
+```toml
+run = "npm install && npm run build && npm start"
+
+[nix]
+channel = "stable-23_11"
+
+[nix.packages]
+yt-dlp = "*"
+
+[env]
+PORT = "5000"
+NODE_ENV = "production"
+```
+
+---
+
+### 4. server.js
+
+```js
+'use strict';
+
+const express      = require('express');
+const cors         = require('cors');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+const ytDlp        = require('yt-dlp-exec');
+const path         = require('path');
+const fs           = require('fs');
+const { execSync } = require('child_process');
+const { Readable } = require('stream');
+require('dotenv').config();
+
+// ─── تهيئة p-queue (ESM داخل CommonJS) ───────────────────────────────────────
+let dlQueue = null;
+(async () => {
+  try {
+    const { default: PQueue } = await import('p-queue');
+    dlQueue = new PQueue({ concurrency: MAX_CONCURRENT });
+    console.log(`✅ Download queue ready (max ${MAX_CONCURRENT} concurrent)`);
+  } catch (e) {
+    console.warn('⚠️  p-queue failed to load, downloads will run without queue:', e.message);
+  }
+})();
+
+// ─── الثوابت ─────────────────────────────────────────────────────────────────
+const app            = express();
+const PORT           = parseInt(process.env.PORT || '5000');
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_DOWNLOADS || '3');
+const TMP_MAX_AGE    = parseInt(process.env.TMP_MAX_AGE_MINUTES || '10') * 60 * 1000;
+const IS_PROD        = process.env.NODE_ENV === 'production';
+
+// ─── قائمة النطاقات المسموحة ──────────────────────────────────────────────────
+const ALLOWED_SOURCE_DOMAINS = [
+  'youtube.com', 'youtu.be',
+  'tiktok.com',
+  'instagram.com',
+  'x.com', 'twitter.com'
+];
+
+const CDN_PATTERNS = [
+  /\.googlevideo\.com$/,
+  /twimg\.com$/,
+  /\.tiktokcdn\.com$/,
+  /\.tiktokcdn-us\.com$/,
+  /\.fbcdn\.net$/,
+  /\.cdninstagram\.com$/,
+  /\.akamaized\.net$/,
+  /tapecontent\.net$/,
+  /\.ssncdn\.com$/,
+  /^localhost$/,
+  /^127\.0\.0\.1$/
+];
+
+// ─── دوال المساعدة ────────────────────────────────────────────────────────────
+function isAllowedSourceUrl(u) {
+  try {
+    const host = new URL(u).hostname.replace(/^www\./, '').toLowerCase();
+    return ALLOWED_SOURCE_DOMAINS.some(d => host === d || host.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
+
+function isCdnUrl(u) {
+  try {
+    const host = new URL(u).hostname.toLowerCase();
+    return CDN_PATTERNS.some(p => p.test(host));
+  } catch {
+    return false;
+  }
+}
+
+function safeName(s) {
+  return (s || 'media')
+    .toString()
+    .replace(/[^\w\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .slice(0, 80) || 'media';
+}
+
+function cleanupFiles(base) {
+  ['mp3', 'webm', 'm4a', 'opus', 'mp4', 'part'].forEach(ext => {
+    const p = base + '.' + ext;
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  });
+}
+
+function fmtError(e) {
+  const msg = e?.message || '';
+  if (msg.includes('abort') || msg.includes('timeout')) return 'انتهت مهلة الطلب، حاول مجدداً';
+  if (msg.includes('cookies'))      return 'المحتوى خاص أو يتطلب تسجيل دخول';
+  if (msg.includes('Private'))      return 'هذا الفيديو خاص ولا يمكن تحميله';
+  if (msg.includes('not available')) return 'الفيديو غير متاح في منطقتك';
+  if (msg.includes('removed'))      return 'تم حذف هذا الفيديو';
+  if (msg.includes('HTTP 403'))     return 'انتهت صلاحية رابط التحميل، أعد الجلب';
+  if (msg.includes('HTTP 404'))     return 'الفيديو غير موجود';
+  return 'فشل استخراج الفيديو، تحقق من الرابط وحاول مجدداً';
+}
+
+// ─── مجلد tmp ─────────────────────────────────────────────────────────────────
+const TMP_DIR = path.join(__dirname, 'tmp');
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+
+// ─── تنظيف تلقائي لـ tmp ─────────────────────────────────────────────────────
+function cleanTmp() {
+  try {
+    const now   = Date.now();
+    const files = fs.readdirSync(TMP_DIR);
+    let deleted = 0;
+    files.forEach(f => {
+      const fp = path.join(TMP_DIR, f);
+      try {
+        if (now - fs.statSync(fp).mtimeMs > TMP_MAX_AGE) {
+          fs.unlinkSync(fp);
+          deleted++;
+        }
+      } catch {}
+    });
+    if (deleted > 0) console.log(`🧹 Cleaned ${deleted} temp file(s)`);
+  } catch {}
+}
+cleanTmp();
+setInterval(cleanTmp, 60 * 60 * 1000);
+
+// ─── Middleware: Security ──────────────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy:    false,
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
+
+// ─── Middleware: CORS ──────────────────────────────────────────────────────────
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // السماح بطلبات بدون origin (مثل curl أو الخادم نفسه)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS: origin "${origin}" not allowed`));
+  },
+  methods:     ['GET', 'POST'],
+  credentials: false
+}));
+
+// ─── Middleware: Body ──────────────────────────────────────────────────────────
+app.use(express.json({ limit: '2kb' }));
+
+// ─── Middleware: Rate Limiting ────────────────────────────────────────────────
+const apiLimiter = rateLimit({
+  windowMs:       60_000,
+  max:            10,
+  standardHeaders: true,
+  legacyHeaders:  false,
+  skip:           (req) => req.path === '/api/health',
+  message:        { error: 'طلبات كثيرة جداً، انتظر دقيقة ثم حاول مجدداً' }
+});
+app.use('/api', apiLimiter);
+
+// ─── Health Check ─────────────────────────────────────────────────────────────
+app.get('/api/health', (_req, res) => {
+  let ytDlpVersion = 'unknown';
+  try {
+    ytDlpVersion = execSync('yt-dlp --version', { timeout: 3000 })
+      .toString()
+      .trim();
+  } catch {}
+
+  let tmpCount = 0;
+  try { tmpCount = fs.readdirSync(TMP_DIR).length; } catch {}
+
+  res.json({
+    status:       'ok',
+    version:      '4.0.0',
+    uptime:       Math.floor(process.uptime()),
+    ytDlpVersion,
+    queue: {
+      size:    dlQueue?.size    ?? 0,
+      pending: dlQueue?.pending ?? 0,
+      max:     MAX_CONCURRENT
+    },
+    tmp: {
+      files:      tmpCount,
+      maxAgeMins: TMP_MAX_AGE / 60000
+    },
+    memory: {
+      heapUsed:  Math.round(process.memoryUsage().heapUsed  / 1e6) + 'MB',
+      heapTotal: Math.round(process.memoryUsage().heapTotal / 1e6) + 'MB'
+    }
+  });
+});
+
+// ─── Extract: جلب معلومات الفيديو ─────────────────────────────────────────────
+app.post('/api/extract', async (req, res) => {
+  const { url } = req.body || {};
+
+  // التحقق من الرابط
+  if (!url || typeof url !== 'string') {
+    return res.json({ success: false, error: 'الرجاء إدخال رابط صالح' });
+  }
+  if (url.length > 2048) {
+    return res.json({ success: false, error: 'الرابط طويل جداً' });
+  }
+  if (!isAllowedSourceUrl(url)) {
+    return res.json({ success: false, error: 'الرابط غير مدعوم — يُدعم: يوتيوب، تيك توك، إنستغرام، تويتر' });
+  }
+
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const ytDlpArgs = {
+      dumpSingleJson:      true,
+      noPlaylist:          true,
+      format:              'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[ext=webm]/best',
+      userAgent:           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      noWarnings:          true,
+      noCheckCertificates: true,
+      socketTimeout:       20
+    };
+
+    // محاولة استخدام cookies إن وُجد Chrome (اختياري)
+    try {
+      execSync('which google-chrome || which chromium-browser || which chromium', { timeout: 1000 });
+      ytDlpArgs.cookiesFromBrowser = 'chrome';
+    } catch {}
+
+    const info = await ytDlp(url, ytDlpArgs);
+
+    if (!info) {
+      return res.json({ success: false, error: 'لم يتم الحصول على معلومات الفيديو' });
+    }
+
+    // التحقق من نوع المحتوى
+    const isPlaylist = info._type === 'playlist' || info._type === 'multi_video';
+
+    // فيلتر وترتيب الصيغ
+    const seen    = new Set();
+    const formats = (info.formats || [])
+      .filter(f => f.url && f.height && (f.ext === 'mp4' || f.vcodec !== 'none'))
+      .map(f => ({
+        quality:  f.height + 'p',
+        height:   f.height,
+        url:      f.url,
+        ext:      f.ext || 'mp4',
+        filesize: f.filesize || f.filesize_approx || null,
+        vcodec:   f.vcodec || '',
+        acodec:   f.acodec || ''
+      }))
+      .filter(f => {
+        if (seen.has(f.height)) return false;
+        seen.add(f.height);
+        return true;
+      })
+      .sort((a, b) => b.height - a.height)
+      .slice(0, 6);
+
+    if (!formats.length) {
+      return res.json({ success: false, error: 'لا توجد صيغ فيديو متاحة لهذا الرابط' });
+    }
+
+    return res.json({
+      success:      true,
+      title:        info.title        || 'فيديو بدون عنوان',
+      thumbnail:    info.thumbnail    || '',
+      duration:     info.duration     || 0,
+      uploader:     info.uploader     || info.channel || '',
+      viewCount:    info.view_count   || 0,
+      likeCount:    info.like_count   || 0,
+      uploadDate:   info.upload_date  || '',
+      isPlaylist,
+      playlistNote: isPlaylist ? 'ملاحظة: تم استخراج الفيديو الأول فقط من القائمة' : null,
+      formats,
+      originalUrl:  url
+    });
+
+  } catch (e) {
+    return res.json({ success: false, error: fmtError(e) });
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+// ─── Download: تحميل الفيديو أو الصوت ────────────────────────────────────────
+app.get('/api/download', async (req, res) => {
+  const { url, originalUrl, filename, mode } = req.query;
+
+  // التحقق من المعاملات
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'رابط مطلوب' });
+  }
+  if (!isCdnUrl(url)) {
+    return res.status(403).json({ error: 'ممنوع: رابط CDN غير معتمد' });
+  }
+
+  const name    = safeName(filename);
+  const tmpBase = path.join(TMP_DIR, `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+
+  const runDownload = async () => {
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), 120_000);
+
+    try {
+      // ══════════════════════════════════════════════════
+      // وضع MP3: استخراج الصوت عبر yt-dlp
+      // ══════════════════════════════════════════════════
+      if (mode === 'mp3') {
+        const srcUrl = (originalUrl && isAllowedSourceUrl(originalUrl))
+          ? originalUrl
+          : url;
+
+        await ytDlp(srcUrl, {
+          extractAudio:        true,
+          audioFormat:         'mp3',
+          audioQuality:        '192K',
+          output:              tmpBase + '.%(ext)s',
+          userAgent:           'Mozilla/5.0',
+          noPlaylist:          true,
+          noCheckCertificates: true,
+          noWarnings:          true
+        });
+
+        const mp3Path = tmpBase + '.mp3';
+        if (!fs.existsSync(mp3Path)) {
+          throw new Error('فشل إنشاء ملف MP3');
+        }
+
+        const { size } = fs.statSync(mp3Path);
+        res.setHeader('Content-Type',        'audio/mpeg');
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}.mp3`);
+        res.setHeader('Content-Length',      size);
+        res.setHeader('Cache-Control',       'no-store');
+
+        const stream = fs.createReadStream(mp3Path);
+        stream.pipe(res);
+        const cleanup = () => { try { fs.unlinkSync(mp3Path); } catch {} };
+        stream.on('end',   cleanup);
+        stream.on('error', () => { cleanup(); if (!res.headersSent) res.status(500).end(); });
+        return;
+      }
+
+      // ══════════════════════════════════════════════════
+      // وضع MP4: جلب الفيديو مباشرة من CDN
+      // ══════════════════════════════════════════════════
+      const { default: fetch } = await import('node-fetch');
+      const fetchRes = await fetch(url, {
+        method:  'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer':    'https://www.google.com/',
+          'Accept':     'video/mp4,video/*;q=0.9,*/*;q=0.8'
+        },
+        signal: controller.signal
+      });
+
+      if (!fetchRes.ok) {
+        throw new Error(`HTTP ${fetchRes.status}`);
+      }
+
+      res.setHeader('Content-Type',        'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}.mp4`);
+      res.setHeader('Cache-Control',       'no-store');
+
+      const contentLength = fetchRes.headers.get('content-length');
+      if (contentLength) res.setHeader('Content-Length', contentLength);
+
+      // تحويل Web ReadableStream إلى Node.js Stream
+      const nodeStream = Readable.fromWeb
+        ? Readable.fromWeb(fetchRes.body)
+        : fetchRes.body;
+
+      nodeStream.pipe(res);
+      nodeStream.on('error', (err) => {
+        console.error('Stream error:', err.message);
+        if (!res.headersSent) res.status(500).end();
+      });
+      res.on('close', () => {
+        // إلغاء الطلب إن أغلق المستخدم الاتصال
+        if (!res.writableEnded) controller.abort();
+      });
+
+    } catch (e) {
+      cleanupFiles(tmpBase);
+      const msg = e?.message?.includes('abort')
+        ? 'انتهت مهلة التحميل، حاول مجدداً'
+        : fmtError(e);
+      if (!res.headersSent) res.status(500).json({ error: msg });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // تشغيل عبر Queue إن كانت جاهزة
+  try {
+    if (dlQueue) await dlQueue.add(runDownload);
+    else         await runDownload();
+  } catch (e) {
+    if (!res.headersSent) res.status(500).json({ error: 'خطأ في خادم التحميل' });
+  }
+});
+
+// ─── معالجة الأخطاء العامة ────────────────────────────────────────────────────
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled error:', err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'خطأ في الخادم' });
+});
+
+// ─── خدمة الواجهة الأمامية ────────────────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'dist'), {
+  maxAge: IS_PROD ? '1d' : 0,
+  etag:   true
+}));
+app.get('*', (_req, res) => {
+  const indexPath = path.join(__dirname, 'dist', 'index.html');
+  if (fs.existsSync(indexPath)) res.sendFile(indexPath);
+  else res.status(503).send('الواجهة غير مبنية — شغّل: npm run build');
+});
+
+// ─── تشغيل الخادم ─────────────────────────────────────────────────────────────
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('');
+  console.log('╔══════════════════════════════════════╗');
+  console.log(`║  ✅  Media Downloader v4.0           ║`);
+  console.log(`║  🌐  http://localhost:${PORT}           ║`);
+  console.log(`║  📦  Queue: max ${MAX_CONCURRENT} concurrent        ║`);
+  console.log(`║  🧹  Tmp cleanup: every 60 min       ║`);
+  console.log('╚══════════════════════════════════════╝');
+  console.log('');
+});
+
+// ─── إيقاف نظيف ──────────────────────────────────────────────────────────────
+process.on('SIGTERM', () => { cleanTmp(); process.exit(0); });
+process.on('SIGINT',  () => { cleanTmp(); process.exit(0); });
+```
+
+---
+
+### 5. vite.config.js
+
+```js
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': {
+        target:       'http://localhost:5000',
+        changeOrigin: true,
+        secure:       false
+      }
+    }
+  },
+  build: {
+    outDir:   'dist',
+    emptyOutDir: true,
+    sourcemap: false
+  }
+});
+```
+
+---
+
+### 6. index.html
+
+```html
+
+
+
+  
+  
+  
+  
+  
+  Media Downloader
+
+
+  
+  
+
+
+```
+
+---
+
+### 7. src/main.jsx
+
+```jsx
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+import './App.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  
+    
+  
+);
+```
+
+---
+
+### 8. src/App.jsx
+
+```jsx
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import axios from 'axios';
+import {
+  FiDownload, FiMusic, FiFilm, FiLink, FiClock,
+  FiSun, FiMoon, FiEye, FiUser, FiAlertCircle,
+  FiInfo, FiThumbsUp, FiCalendar, FiX
+} from 'react-icons/fi';
+import './App.css';
+
+// ─── ثوابت ────────────────────────────────────────────────────────────────────
+const SUPPORTED_DOMAINS = [
+  'youtube.com', 'youtu.be',
+  'tiktok.com',
+  'instagram.com',
+  'x.com', 'twitter.com'
+];
+const HISTORY_KEY = 'mdl_history_v2';
+const MAX_HISTORY = 5;
+
+// ─── دوال تنسيق ───────────────────────────────────────────────────────────────
+function fmtDuration(s) {
+  if (!s || s <= 0) return '';
+  const h   = Math.floor(s / 3600);
+  const m   = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+  return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+function fmtNumber(n) {
+  if (!n || n <= 0) return '';
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + 'B';
+  if (n >= 1_000_000)     return (n / 1_000_000).toFixed(1)     + 'M';
+  if (n >= 1_000)         return (n / 1_000).toFixed(0)         + 'K';
+  return n.toLocaleString();
+}
+
+function fmtDate(d) {
+  if (!d || d.length !== 8) return '';
+  return `${d.slice(0, 4)}/${d.slice(4, 6)}/${d.slice(6, 8)}`;
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return '';
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(0) + ' MB';
+  return (bytes / 1e3).toFixed(0) + ' KB';
+}
+
+// ─── سجل المحفوظات ────────────────────────────────────────────────────────────
+function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); }
+  catch { return []; }
+}
+
+function saveToHistory(url, title) {
+  const prev = loadHistory().filter(h => h.url !== url);
+  const next = [{ url, title: title || url, ts: Date.now() }, ...prev].slice(0, MAX_HISTORY);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+}
+
+// ─── التحقق من الرابط ─────────────────────────────────────────────────────────
+function isSupportedUrl(u) {
+  try {
+    const host = new URL(u).hostname.replace(/^www\./, '');
+    return SUPPORTED_DOMAINS.some(d => host === d || host.endsWith('.' + d));
+  } catch { return false; }
+}
+
+// ─── المكوّن الرئيسي ──────────────────────────────────────────────────────────
+export default function App() {
+  const [url,       setUrl]      = useState('');
+  const [mode,      setMode]     = useState('video');
+  const [formats,   setFormats]  = useState([]);
+  const [selected,  setSelected] = useState(null);
+  const [meta,      setMeta]     = useState(null);
+  const [loading,   setLoading]  = useState(false);
+  const [error,     setError]    = useState('');
+  const [infoMsg,   setInfoMsg]  = useState('');
+  const [dlState,   setDlState]  = useState({ active: false, progress: 0, done: false });
+  const [theme,     setTheme]    = useState('dark');
+  const [history,   setHistory]  = useState([]);
+  const [showHist,  setShowHist] = useState(false);
+  const [health,    setHealth]   = useState(null);
+  const originalUrlRef = useRef('');
+  const histRef        = useRef(null);
+
+  // ─── تهيئة ──────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    // استعادة الإعدادات
+    const savedMode  = localStorage.getItem('mdl_mode');
+    const savedTheme = localStorage.getItem('mdl_theme') || 'dark';
+    if (savedMode === 'mp3' || savedMode === 'video') setMode(savedMode);
+    applyTheme(savedTheme);
+    setHistory(loadHistory());
+
+    // لصق الرابط تلقائياً من الحافظة
+    navigator.clipboard?.readText?.()
+      .then(text => {
+        try {
+          if (isSupportedUrl(text.trim())) setUrl(text.trim());
+        } catch {}
+      })
+      .catch(() => {});
+
+    // Health check
+    axios.get('/api/health', { timeout: 5000 })
+      .then(r => setHealth(r.data))
+      .catch(() => setHealth(null));
+
+    // إغلاق القائمة عند النقر خارجها
+    const handler = (e) => {
+      if (histRef.current && !histRef.current.contains(e.target)) setShowHist(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  // ─── الثيم ──────────────────────────────────────────────────────────────────
+  function applyTheme(t) {
+    setTheme(t);
+    document.documentElement.setAttribute('data-theme', t);
+    localStorage.setItem('mdl_theme', t);
+  }
+
+  const toggleTheme = () => applyTheme(theme === 'dark' ? 'light' : 'dark');
+
+  // ─── جلب معلومات الفيديو ────────────────────────────────────────────────────
+  const fetchVideo = useCallback(async (inputUrl) => {
+    const target = (inputUrl || url).trim();
+    if (!target) return setError('الرجاء إدخال رابط الفيديو');
+    if (inputUrl) setUrl(inputUrl);
+
+    // إعادة تعيين الحالة
+    setError(''); setInfoMsg('');
+    setLoading(true); setFormats([]);
+    setMeta(null);   setSelected(null);
+    setShowHist(false);
+
+    try {
+      const { data } = await axios.post(
+        '/api/extract',
+        { url: target },
+        { timeout: 35_000 }
+      );
+
+      if (data.success) {
+        setMeta(data);
+        setFormats(data.formats);
+        if (data.formats.length) setSelected(data.formats[0]);
+        originalUrlRef.current = target;
+        saveToHistory(target, data.title);
+        setHistory(loadHistory());
+        if (data.playlistNote) setInfoMsg(data.playlistNote);
+      } else {
+        setError(data.error || 'حدث خطأ غير متوقع');
+      }
+    } catch (e) {
+      if (e.code === 'ECONNABORTED') setError('انتهت مهلة الطلب، حاول مجدداً');
+      else if (e.response?.data?.error) setError(e.response.data.error);
+      else setError('فشل الاتصال بالخادم');
+    } finally {
+      setLoading(false);
+    }
+  }, [url]);
+
+  // ─── تحميل الملف ────────────────────────────────────────────────────────────
+  const download = useCallback(async () => {
+    if (!selected) return setError('اختر جودة التحميل أولاً');
+    setError('');
+    setDlState({ active: true, progress: 3, done: false });
+
+    const params = new URLSearchParams({
+      url:         selected.url,
+      originalUrl: originalUrlRef.current,
+      filename:    meta?.title || 'media',
+      mode
+    });
+
+    try {
+      const response = await fetch(`/api/download?${params}`);
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${response.status}`);
+      }
+
+      const totalSize = parseInt(response.headers.get('content-length') || '0');
+      const reader    = response.body.getReader();
+      const chunks    = [];
+      let received    = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        const progress = totalSize > 0
+          ? Math.min(Math.round((received / totalSize) * 100), 99)
+          : Math.min(Math.round(received / 100_000), 90);
+        setDlState({ active: true, progress, done: false });
+      }
+
+      // إنشاء الملف وتحميله
+      const ext  = mode === 'mp3' ? 'mp3' : 'mp4';
+      const type = mode === 'mp3' ? 'audio/mpeg' : 'video/mp4';
+      const blob = new Blob(chunks, { type });
+      const a    = document.createElement('a');
+      a.href     = URL.createObjectURL(blob);
+      a.download = `${(meta?.title || 'media').replace(/[^\w\u0600-\u06FF\s\-]/g, '_')}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+
+      setDlState({ active: true, progress: 100, done: true });
+      setTimeout(() => setDlState({ active: false, progress: 0, done: false }), 3000);
+
+    } catch (e) {
+      setError(e.message || 'فشل التحميل، حاول مجدداً');
+      setDlState({ active: false, progress: 0, done: false });
+    }
+  }, [selected, meta, mode]);
+
+  // ─── تغيير الوضع ────────────────────────────────────────────────────────────
+  const changeMode = (newMode) => {
+    setMode(newMode);
+    localStorage.setItem('mdl_mode', newMode);
+  };
+
+  const handleKey = (e) => {
+    if (e.key === 'Enter' && !loading) fetchVideo();
+    if (e.key === 'Escape') setShowHist(false);
+  };
+
+  // ─── الواجهة ─────────────────────────────────────────────────────────────────
+  return (
+    
+
+      {/* شريط العلوي */}
+      
+        {/* مؤشر الخادم */}
+        
+          {health ? (
+            
+              
+              مباشر
+            
+          ) : (
+            غير متصل
+          )}
+        
+
+        {/* زر الثيم */}
+        
+          {theme === 'dark' ?  : }
+        
+      
+
+      {/* العنوان */}
+      ⬇ Media Downloader
+      يوتيوب · تيك توك · إنستغرام · تويتر
+
+      {/* البطاقة الرئيسية */}
+      
+
+        {/* حقل الرابط + سجل المحفوظات */}
+        
+          
+            
+            <input
+              value={url}
+              onChange={e => { setUrl(e.target.value); if (showHist) setShowHist(false); }}
+              onKeyDown={handleKey}
+              onFocus={() => { if (history.length > 0 && !url) setShowHist(true); }}
+              placeholder="الصق رابط الفيديو هنا..."
+              className="input"
+              dir="ltr"
+              type="url"
+              autoComplete="off"
+              spellCheck="false"
+            />
+            {url && (
+              <button
+                className="input-clear"
+                onClick={() => { setUrl(''); setMeta(null); setFormats([]); setError(''); }}
+                aria-label="مسح الرابط">
+                
+              
+            )}
+          
+
+          {/* قائمة السجل */}
+          {showHist && history.length > 0 && (
+            
+              
+                الروابط السابقة
+                <button
+                  className="hist-clear-btn"
+                  onClick={() => {
+                    localStorage.removeItem(HISTORY_KEY);
+                    setHistory([]);
+                    setShowHist(false);
+                  }}>
+                  مسح الكل
+                
+              
+              {history.map((h, i) => (
+                <button
+                  key={i}
+                  className="hist-item"
+                  role="option"
+                  onClick={() => fetchVideo(h.url)}>
+                  
+                  {h.title}
+                
+              ))}
+            
+          )}
+        
+
+        {/* اختيار الوضع */}
+        
+          <button
+            onClick={() => changeMode('video')}
+            className={mode === 'video' ? 'mode-btn active' : 'mode-btn'}
+            aria-pressed={mode === 'video'}>
+             فيديو MP4
+          
+          <button
+            onClick={() => changeMode('mp3')}
+            className={mode === 'mp3' ? 'mode-btn active' : 'mode-btn'}
+            aria-pressed={mode === 'mp3'}>
+             صوت MP3
+          
+        
+
+        {/* زر الجلب */}
+        <button
+          onClick={() => fetchVideo()}
+          disabled={loading}
+          className="btn btn-primary"
+          aria-busy={loading}>
+          {loading
+            ? <> جاري الجلب...</>
+            : <>🔍 جلب معلومات الفيديو</>}
+        
+
+        {/* رسالة خطأ */}
+        {error && (
+          
+            
+            {error}
+          
+        )}
+
+        {/* رسالة معلومات */}
+        {infoMsg && (
+          
+            
+            {infoMsg}
+          
+        )}
+
+        {/* معلومات الفيديو */}
+        {meta && (
+          
+            {meta.thumbnail && (
+              
+            )}
+            
+              {meta.title}
+              
+                {meta.uploader && (
+                  
+                    
+                    {meta.uploader}
+                  
+                )}
+                {meta.duration > 0 && (
+                  
+                    
+                    {fmtDuration(meta.duration)}
+                  
+                )}
+                {meta.viewCount > 0 && (
+                  
+                    
+                    {fmtNumber(meta.viewCount)} مشاهدة
+                  
+                )}
+                {meta.likeCount > 0 && (
+                  
+                    
+                    {fmtNumber(meta.likeCount)}
+                  
+                )}
+                {meta.uploadDate && (
+                  
+                    
+                    {fmtDate(meta.uploadDate)}
+                  
+                )}
+              
+            
+          
+        )}
+
+        {/* اختيار الجودة */}
+        {formats.length > 0 && (
+          
+            اختر الجودة
+            
+              {formats.map(f => (
+                <button
+                  key={f.height}
+                  onClick={() => setSelected(f)}
+                  className={selected?.height === f.height ? 'qual-btn active' : 'qual-btn'}
+                  aria-pressed={selected?.height === f.height}
+                  title={f.filesize ? fmtSize(f.filesize) : ''}>
+                  {f.quality}
+                  {f.filesize && (
+                    {fmtSize(f.filesize)}
+                  )}
+                
+              ))}
+            
+          
+        )}
+
+        {/* زر التحميل */}
+        {selected && !dlState.active && (
+          
+            
+            تحميل {mode === 'mp3' ? 'MP3' : `${selected.quality} MP4`}
+            {selected.filesize && (
+              ({fmtSize(selected.filesize)})
+            )}
+          
+        )}
+
+        {/* شريط التقدم */}
+        {dlState.active && (
+          
+            
+            
+              {dlState.done
+                ? '✅ اكتمل التحميل!'
+                : `جاري التحميل ${dlState.progress}%`}
+            
+          
+        )}
+
+      
+
+      {/* تذييل */}
+      
+        🔒 جميع التحميلات تتم عبر الخادم بشكل آمن — لا يُفتح أي رابط خارجي
+      
+
+      {/* معلومات الخادم (تُخفى في الإنتاج) */}
+      {health && process.env.NODE_ENV !== 'production' && (
+        
+          uptime: {health.uptime}s · queue: {health.queue?.size}/{health.queue?.max} · mem: {health.memory?.heapUsed}
+        
+      )}
+
+    
+  );
+}
+```
+
+---
+
+### 9. src/App.css
+
+```css
+/* ══════════════════════════════════════════════════════════════════
+   CSS Variables — Dark Mode (افتراضي)
+══════════════════════════════════════════════════════════════════ */
+:root,
+[data-theme="dark"] {
+  --bg-page:      #07070e;
+  --bg-card:      #0f0f1a;
+  --bg-input:     #060609;
+  --bg-hover:     #14142a;
+  --border:       #1c1c32;
+  --border-focus: #3b82f6;
+  --text-primary:   #eeeef5;
+  --text-secondary: #9999bb;
+  --text-muted:     #44445a;
+  --accent:       #3b82f6;
+  --accent-alt:   #8b5cf6;
+  --accent-pink:  #ec4899;
+  --success:      #22c55e;
+  --err-bg:       rgba(239, 68, 68, 0.07);
+  --err-border:   rgba(239, 68, 68, 0.28);
+  --err-text:     #f87171;
+  --info-bg:      rgba(59, 130, 246, 0.07);
+  --info-border:  rgba(59, 130, 246, 0.28);
+  --info-text:    #60a5fa;
+  --shadow:       0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+[data-theme="light"] {
+  --bg-page:      #f0f1f8;
+  --bg-card:      #ffffff;
+  --bg-input:     #f5f6fc;
+  --bg-hover:     #eaebf5;
+  --border:       #d8daea;
+  --border-focus: #2563eb;
+  --text-primary:   #0e0e22;
+  --text-secondary: #4a4a6a;
+  --text-muted:     #9090aa;
+  --accent:       #2563eb;
+  --accent-alt:   #7c3aed;
+  --accent-pink:  #db2777;
+  --success:      #16a34a;
+  --err-bg:       #fff1f1;
+  --err-border:   #fca5a5;
+  --err-text:     #dc2626;
+  --info-bg:      #eff6ff;
+  --info-border:  #93c5fd;
+  --info-text:    #1d4ed8;
+  --shadow:       0 8px 32px rgba(0, 0, 0, 0.1);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Reset
+══════════════════════════════════════════════════════════════════ */
+*, *::before, *::after {
+  margin: 0; padding: 0;
+  box-sizing: border-box;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background:   var(--bg-page);
+  color:        var(--text-primary);
+  font-family:  'Segoe UI', Tahoma, 'Helvetica Neue', Arial, sans-serif;
+  font-size:    15px;
+  line-height:  1.6;
+  display:      flex;
+  justify-content: center;
+  min-height:   100vh;
+  padding:      40px 16px 64px;
+  transition:   background 0.3s ease, color 0.3s ease;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Layout
+══════════════════════════════════════════════════════════════════ */
+.app {
+  width:     100%;
+  max-width: 520px;
+  text-align: center;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Top Bar
+══════════════════════════════════════════════════════════════════ */
+.top-bar {
+  display:         flex;
+  justify-content: space-between;
+  align-items:     center;
+  margin-bottom:   24px;
+}
+
+.server-status { display: flex; align-items: center; }
+
+.status-live {
+  display:     flex;
+  align-items: center;
+  gap:         6px;
+  font-size:   12px;
+  color:       var(--text-muted);
+  cursor:      default;
+}
+
+.status-dot {
+  width:            8px;
+  height:           8px;
+  border-radius:    50%;
+  background:       var(--success);
+  animation:        pulse-dot 2.5s ease-in-out infinite;
+  flex-shrink:      0;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1);    }
+  50%      { opacity: 0.4; transform: scale(0.8); }
+}
+
+.status-off { font-size: 12px; color: var(--text-muted); }
+
+.icon-btn {
+  background:    transparent;
+  border:        1px solid var(--border);
+  border-radius: 10px;
+  padding:       8px 10px;
+  color:         var(--text-secondary);
+  cursor:        pointer;
+  display:       flex;
+  align-items:   center;
+  transition:    background 0.2s, color 0.2s;
+  line-height:   1;
+}
+.icon-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* ══════════════════════════════════════════════════════════════════
+   Title
+══════════════════════════════════════════════════════════════════ */
+.title {
+  font-size:   30px;
+  font-weight: 700;
+  background:  linear-gradient(135deg, var(--accent), var(--accent-alt), var(--accent-pink));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 6px;
+  letter-spacing: -0.02em;
+}
+
+.subtitle {
+  color:         var(--text-muted);
+  font-size:     13px;
+  margin-bottom: 28px;
+  letter-spacing: 0.07em;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Card
+══════════════════════════════════════════════════════════════════ */
+.card {
+  background:    var(--bg-card);
+  border:        1px solid var(--border);
+  border-radius: 20px;
+  padding:       26px;
+  display:       flex;
+  flex-direction: column;
+  gap:           14px;
+  box-shadow:    var(--shadow);
+  transition:    background 0.3s;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Input
+══════════════════════════════════════════════════════════════════ */
+.input-group { position: relative; }
+
+.input-wrap {
+  position:    relative;
+  display:     flex;
+  align-items: center;
+}
+
+.input-icon {
+  position:       absolute;
+  right:          14px;
+  color:          var(--text-muted);
+  pointer-events: none;
+  z-index:        1;
+}
+
+.input {
+  width:         100%;
+  padding:       13px 42px 13px 40px;
+  background:    var(--bg-input);
+  border:        1px solid var(--border);
+  border-radius: 12px;
+  color:         var(--text-primary);
+  font-size:     14px;
+  outline:       none;
+  transition:    border-color 0.2s, box-shadow 0.2s;
+  direction:     ltr;
+  text-align:    left;
+}
+.input:focus {
+  border-color: var(--border-focus);
+  box-shadow:   0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+.input::placeholder { color: var(--text-muted); }
+
+.input-clear {
+  position:      absolute;
+  left:          12px;
+  background:    transparent;
+  border:        none;
+  color:         var(--text-muted);
+  cursor:        pointer;
+  padding:       4px;
+  border-radius: 6px;
+  display:       flex;
+  align-items:   center;
+  transition:    color 0.2s;
+  line-height:   1;
+}
+.input-clear:hover { color: var(--text-primary); }
+
+/* ══════════════════════════════════════════════════════════════════
+   History Dropdown
+══════════════════════════════════════════════════════════════════ */
+.hist-drop {
+  position:      absolute;
+  top:           calc(100% + 6px);
+  right:         0; left: 0;
+  background:    var(--bg-card);
+  border:        1px solid var(--border);
+  border-radius: 14px;
+  overflow:      hidden;
+  z-index:       100;
+  box-shadow:    var(--shadow);
+}
+
+.hist-header {
+  display:         flex;
+  justify-content: space-between;
+  align-items:     center;
+  padding:         9px 14px 7px;
+  border-bottom:   1px solid var(--border);
+  font-size:       11px;
+  color:           var(--text-muted);
+}
+
+.hist-clear-btn {
+  background:    transparent;
+  border:        none;
+  color:         var(--err-text);
+  cursor:        pointer;
+  font-size:     11px;
+  padding:       2px 6px;
+  border-radius: 6px;
+  transition:    background 0.15s;
+}
+.hist-clear-btn:hover { background: var(--err-bg); }
+
+.hist-item {
+  width:          100%;
+  display:        flex;
+  align-items:    center;
+  gap:            8px;
+  padding:        10px 14px;
+  background:     transparent;
+  border:         none;
+  border-bottom:  1px solid var(--border);
+  color:          var(--text-secondary);
+  cursor:         pointer;
+  font-size:      13px;
+  text-align:     right;
+  transition:     background 0.15s;
+}
+.hist-item:last-child { border-bottom: none; }
+.hist-item:hover      { background: var(--bg-hover); }
+
+.hist-title {
+  flex:          1;
+  overflow:      hidden;
+  text-overflow: ellipsis;
+  white-space:   nowrap;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Modes
+══════════════════════════════════════════════════════════════════ */
+.modes { display: flex; gap: 8px; }
+
+.mode-btn {
+  flex:            1;
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+  gap:             7px;
+  padding:         11px;
+  border-radius:   11px;
+  background:      transparent;
+  border:          1px solid var(--border);
+  color:           var(--text-secondary);
+  cursor:          pointer;
+  font-size:       14px;
+  font-weight:     500;
+  transition:      all 0.2s;
+}
+.mode-btn.active {
+  border-color: var(--accent);
+  background:   rgba(59, 130, 246, 0.09);
+  color:        var(--accent);
+}
+.mode-btn:not(.active):hover { background: var(--bg-hover); }
+
+/* ══════════════════════════════════════════════════════════════════
+   Buttons
+══════════════════════════════════════════════════════════════════ */
+.btn {
+  width:           100%;
+  padding:         13px 16px;
+  border-radius:   12px;
+  font-size:       15px;
+  font-weight:     600;
+  border:          none;
+  cursor:          pointer;
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+  gap:             8px;
+  transition:      opacity 0.2s, transform 0.12s;
+}
+.btn:active   { transform: scale(0.98); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--accent);
+  color:      #fff;
+}
+.btn-primary:hover:not(:disabled) { opacity: 0.88; }
+
+.btn-download {
+  background: linear-gradient(135deg, var(--accent), var(--accent-alt));
+  color:      #fff;
+}
+.btn-download:hover { opacity: 0.9; }
+
+.dl-size {
+  font-size:   12px;
+  font-weight: 400;
+  opacity:     0.8;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Alerts
+══════════════════════════════════════════════════════════════════ */
+.alert {
+  border-radius: 10px;
+  padding:       11px 14px;
+  font-size:     13px;
+  display:       flex;
+  align-items:   flex-start;
+  gap:           8px;
+  text-align:    right;
+  line-height:   1.5;
+}
+.alert-error {
+  background: var(--err-bg);
+  border:     1px solid var(--err-border);
+  color:      var(--err-text);
+}
+.alert-info {
+  background: var(--info-bg);
+  border:     1px solid var(--info-border);
+  color:      var(--info-text);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Meta Card
+══════════════════════════════════════════════════════════════════ */
+.meta-card {
+  display:       flex;
+  flex-direction: column;
+  gap:           10px;
+  text-align:    right;
+}
+
+.thumb {
+  width:         100%;
+  border-radius: 12px;
+  object-fit:    cover;
+  max-height:    210px;
+  display:       block;
+}
+
+.meta-body { display: flex; flex-direction: column; gap: 8px; }
+
+.video-title {
+  font-size:   14px;
+  font-weight: 500;
+  color:       var(--text-primary);
+  line-height: 1.5;
+  display:     -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow:    hidden;
+}
+
+.meta-chips {
+  display:         flex;
+  flex-wrap:       wrap;
+  gap:             6px;
+  justify-content: flex-end;
+}
+
+.chip {
+  display:       flex;
+  align-items:   center;
+  gap:           4px;
+  font-size:     12px;
+  color:         var(--text-muted);
+  background:    var(--bg-input);
+  border:        1px solid var(--border);
+  border-radius: 20px;
+  padding:       3px 10px;
+  white-space:   nowrap;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Quality Selector
+══════════════════════════════════════════════════════════════════ */
+.quality-section { display: flex; flex-direction: column; gap: 8px; }
+
+.section-label {
+  font-size:  13px;
+  color:      var(--text-muted);
+  text-align: right;
+}
+
+.quals {
+  display:   flex;
+  flex-wrap: wrap;
+  gap:       7px;
+}
+
+.qual-btn {
+  display:        flex;
+  flex-direction: column;
+  align-items:    center;
+  gap:            3px;
+  padding:        9px 16px;
+  border-radius:  10px;
+  background:     var(--bg-input);
+  border:         1px solid var(--border);
+  color:          var(--text-secondary);
+  cursor:         pointer;
+  font-size:      13px;
+  font-weight:    500;
+  transition:     all 0.2s;
+  min-width:      68px;
+}
+.qual-btn.active {
+  border-color: var(--accent);
+  background:   rgba(59, 130, 246, 0.1);
+  color:        var(--accent);
+}
+.qual-btn:not(.active):hover { background: var(--bg-hover); }
+
+.qual-label-text { font-size: 13px; font-weight: 600; }
+
+.qual-size {
+  font-size:   10px;
+  color:       var(--text-muted);
+  font-weight: 400;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Progress Bar
+══════════════════════════════════════════════════════════════════ */
+.progress-wrap {
+  position:        relative;
+  background:      var(--bg-input);
+  border:          1px solid var(--border);
+  border-radius:   12px;
+  height:          50px;
+  overflow:        hidden;
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+  transition:      border-color 0.3s;
+}
+.progress-wrap.done { border-color: var(--success); }
+
+.progress-fill {
+  position:   absolute;
+  right: 0; top: 0;
+  height:     100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-alt));
+  opacity:    0.22;
+  transition: width 0.35s ease;
+}
+.progress-wrap.done .progress-fill { opacity: 0.18; background: var(--success); }
+
+.progress-label {
+  position:    relative;
+  font-size:   14px;
+  font-weight: 500;
+  color:       var(--text-primary);
+  z-index:     1;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Spinner
+══════════════════════════════════════════════════════════════════ */
+.spinner {
+  display:      inline-block;
+  width:        15px;
+  height:       15px;
+  border:       2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation:    spin 0.7s linear infinite;
+  flex-shrink:  0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ══════════════════════════════════════════════════════════════════
+   Footer
+══════════════════════════════════════════════════════════════════ */
+.footer {
+  margin-top: 20px;
+  font-size:  12px;
+  color:      var(--text-muted);
+  line-height: 1.6;
+}
+
+.health-debug {
+  margin-top:  8px;
+  font-size:   11px;
+  color:       var(--text-muted);
+  font-family: monospace;
+  opacity:     0.6;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Responsive
+══════════════════════════════════════════════════════════════════ */
+@media (max-width: 480px) {
+  body       { padding: 24px 12px 48px; }
+  .card      { padding: 20px 18px; }
+  .title     { font-size: 26px; }
+  .btn       { font-size: 14px; }
+  .qual-btn  { padding: 8px 12px; min-width: 58px; }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Accessibility
+══════════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+:focus-visible {
+  outline:        2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius:  4px;
+}
+```
+
+---
+
+## تعليمات التشغيل
+
+```bash
+# 1. تثبيت الحزم
+npm install
+
+# 2. بناء الواجهة
+npm run build
+
+# 3. تشغيل الخادم
+npm start
+```
+
+التطبيق يعمل على: **http://localhost:5000**
+
+للتطوير (مع hot-reload للواجهة):
+```bash
+# نافذة 1: الخادم
+npm run dev
+
+# نافذة 2: الواجهة
+npx vite
+```
+
+---
+
+## ملاحظات تقنية مهمة
+
+| الموضوع | التفاصيل |
+|---|---|
+| `yt-dlp-exec` | يأتي مع yt-dlp مدمج — لا حاجة لـ pip |
+| Replit | yt-dlp يُثبَّت عبر Nix packages تلقائياً |
+| `p-queue` | ESM-only — تُستورد ديناميكياً داخل CommonJS |
+| `cookiesFromBrowser` | يُفعَّل تلقائياً فقط إن وُجد Chrome |
+| Health API | `GET /api/health` — حالة كاملة للخادم |
+| CORS | محدود بقائمة ALLOWED_ORIGINS في .env |
+| Filename encoding | `filename*=UTF-8''` لدعم الأحرف العربية |
+| Stream | `Readable.fromWeb()` لـ Node.js 18+، fallback للإصدارات القديمة |
+| Graceful shutdown | تنظيف tmp عند SIGTERM/SIGINT |
+| Accessibility | aria-labels، role attributes، prefers-reduced-motion |
