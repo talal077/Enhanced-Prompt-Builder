@@ -2,50 +2,32 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import { execSync, execFile } from "child_process";
 import path from "path";
 import fs from "fs";
-import { Readable } from "stream";
 import { logger } from "../lib/logger";
 
 // ─── Locate system yt-dlp binary ─────────────────────────────────────────────
 function findYtDlp(): string {
-  const candidates = [
-    "/usr/bin/yt-dlp",
-    "/usr/local/bin/yt-dlp",
-  ];
-  // Try `which` first
   try {
     const found = execSync("which yt-dlp", { timeout: 3000 }).toString().trim();
     if (found) return found;
   } catch {}
-  // Try nix store glob
   try {
-    const nixPath = execSync("ls /nix/store/*/bin/yt-dlp 2>/dev/null | head -1", { timeout: 3000 })
-      .toString()
-      .trim();
-    if (nixPath) return nixPath;
+    const nix = execSync("ls /nix/store/*/bin/yt-dlp 2>/dev/null | head -1", { timeout: 3000 })
+      .toString().trim();
+    if (nix) return nix;
   } catch {}
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
-  }
-  throw new Error("yt-dlp not found. Install it via system packages.");
+  throw new Error("yt-dlp not found");
 }
 
 const YTDLP_BIN = findYtDlp();
 logger.info({ bin: YTDLP_BIN }, "yt-dlp binary located");
 
-// ─── Helper: run yt-dlp with args, return stdout ─────────────────────────────
+// ─── Helper: run yt-dlp, return stdout ───────────────────────────────────────
 function runYtDlp(args: string[], timeoutMs = 30_000): Promise<string> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error("timeout"));
-    }, timeoutMs);
-
+    const t = setTimeout(() => reject(new Error("timeout")), timeoutMs);
     execFile(YTDLP_BIN, args, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-      clearTimeout(timer);
-      if (err) {
-        const msg = stderr || err.message;
-        reject(new Error(msg));
-        return;
-      }
+      clearTimeout(t);
+      if (err) { reject(new Error(stderr || err.message)); return; }
       resolve(stdout);
     });
   });
@@ -53,45 +35,17 @@ function runYtDlp(args: string[], timeoutMs = 30_000): Promise<string> {
 
 // ─── Allowed Domains ─────────────────────────────────────────────────────────
 const ALLOWED_SOURCE_DOMAINS = [
-  "youtube.com",
-  "youtu.be",
+  "youtube.com", "youtu.be",
   "tiktok.com",
   "instagram.com",
-  "x.com",
-  "twitter.com",
+  "x.com", "twitter.com",
 ];
 
-const CDN_PATTERNS = [
-  /\.googlevideo\.com$/,
-  /twimg\.com$/,
-  /\.tiktokcdn\.com$/,
-  /\.tiktokcdn-us\.com$/,
-  /\.fbcdn\.net$/,
-  /\.cdninstagram\.com$/,
-  /\.akamaized\.net$/,
-  /tapecontent\.net$/,
-  /\.ssncdn\.com$/,
-  /^localhost$/,
-  /^127\.0\.0\.1$/,
-];
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 function isAllowedSourceUrl(u: string): boolean {
   try {
     const host = new URL(u).hostname.replace(/^www\./, "").toLowerCase();
     return ALLOWED_SOURCE_DOMAINS.some((d) => host === d || host.endsWith("." + d));
-  } catch {
-    return false;
-  }
-}
-
-function isCdnUrl(u: string): boolean {
-  try {
-    const host = new URL(u).hostname.toLowerCase();
-    return CDN_PATTERNS.some((p) => p.test(host));
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 function safeName(s: string): string {
@@ -104,30 +58,37 @@ function safeName(s: string): string {
 }
 
 function cleanupFiles(base: string): void {
-  ["mp3", "webm", "m4a", "opus", "mp4", "part"].forEach((ext) => {
+  ["mp3", "webm", "m4a", "opus", "mp4", "part", "temp"].forEach((ext) => {
     const p = base + "." + ext;
-    try {
-      if (fs.existsSync(p)) fs.unlinkSync(p);
-    } catch {}
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
   });
+  // also handle merged files
+  try {
+    const dir = path.dirname(base);
+    const prefix = path.basename(base);
+    fs.readdirSync(dir).filter(f => f.startsWith(prefix)).forEach(f => {
+      try { fs.unlinkSync(path.join(dir, f)); } catch {}
+    });
+  } catch {}
 }
 
 function fmtError(e: unknown): string {
   const msg = (e as Error)?.message || "";
-  if (msg.includes("timeout"))          return "انتهت مهلة الطلب، حاول مجدداً";
-  if (msg.includes("cookies"))          return "المحتوى خاص أو يتطلب تسجيل دخول";
-  if (msg.includes("Private"))          return "هذا الفيديو خاص ولا يمكن تحميله";
-  if (msg.includes("not available"))    return "الفيديو غير متاح في منطقتك";
-  if (msg.includes("removed"))          return "تم حذف هذا الفيديو";
-  if (msg.includes("HTTP Error 403"))   return "انتهت صلاحية رابط التحميل، أعد الجلب";
-  if (msg.includes("HTTP Error 404"))   return "الفيديو غير موجود";
+  if (msg.includes("timeout"))             return "انتهت مهلة الطلب، حاول مجدداً";
+  if (msg.includes("cookies"))             return "المحتوى خاص أو يتطلب تسجيل دخول";
+  if (msg.includes("Private"))             return "هذا الفيديو خاص ولا يمكن تحميله";
+  if (msg.includes("not available in your country")) return "الفيديو غير متاح في منطقتك";
+  if (msg.includes("unavailable"))         return "الفيديو غير متاح";
+  if (msg.includes("removed"))             return "تم حذف هذا الفيديو";
+  if (msg.includes("HTTP Error 403"))      return "انتهت صلاحية رابط التحميل، أعد الجلب";
+  if (msg.includes("HTTP Error 404"))      return "الفيديو غير موجود";
+  if (msg.includes("Sign in"))             return "هذا الفيديو يتطلب تسجيل دخول";
   return "فشل استخراج الفيديو، تحقق من الرابط وحاول مجدداً";
 }
 
 // ─── Tmp Dir ─────────────────────────────────────────────────────────────────
 const TMP_DIR = path.join(process.cwd(), "tmp");
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
-
 const TMP_MAX_AGE = 10 * 60 * 1000;
 
 function cleanTmp(): void {
@@ -135,9 +96,7 @@ function cleanTmp(): void {
     const now = Date.now();
     fs.readdirSync(TMP_DIR).forEach((f) => {
       const fp = path.join(TMP_DIR, f);
-      try {
-        if (now - fs.statSync(fp).mtimeMs > TMP_MAX_AGE) fs.unlinkSync(fp);
-      } catch {}
+      try { if (now - fs.statSync(fp).mtimeMs > TMP_MAX_AGE) fs.unlinkSync(fp); } catch {}
     });
   } catch {}
 }
@@ -153,24 +112,15 @@ function enqueueDownload(fn: () => Promise<void>): Promise<void> {
   return new Promise((resolve, reject) => {
     const run = async () => {
       activeDownloads++;
-      try {
-        await fn();
-        resolve();
-      } catch (e) {
-        reject(e);
-      } finally {
+      try { await fn(); resolve(); }
+      catch (e) { reject(e); }
+      finally {
         activeDownloads--;
-        if (downloadQueue.length > 0) {
-          const next = downloadQueue.shift()!;
-          next();
-        }
+        if (downloadQueue.length > 0) downloadQueue.shift()!();
       }
     };
-    if (activeDownloads < MAX_CONCURRENT) {
-      run();
-    } else {
-      downloadQueue.push(run);
-    }
+    if (activeDownloads < MAX_CONCURRENT) run();
+    else downloadQueue.push(run);
   });
 }
 
@@ -180,18 +130,12 @@ const router: IRouter = Router();
 // ─── Health ───────────────────────────────────────────────────────────────────
 router.get("/health", (_req: Request, res: Response) => {
   let ytDlpVersion = "unknown";
-  try {
-    ytDlpVersion = execSync(`${YTDLP_BIN} --version`, { timeout: 3000 }).toString().trim();
-  } catch {}
-
+  try { ytDlpVersion = execSync(`${YTDLP_BIN} --version`, { timeout: 3000 }).toString().trim(); } catch {}
   let tmpCount = 0;
   try { tmpCount = fs.readdirSync(TMP_DIR).length; } catch {}
-
   res.json({
-    status: "ok",
-    version: "4.0.0",
-    uptime: Math.floor(process.uptime()),
-    ytDlpVersion,
+    status: "ok", version: "4.1.0",
+    uptime: Math.floor(process.uptime()), ytDlpVersion,
     queue: { size: activeDownloads, pending: downloadQueue.length, max: MAX_CONCURRENT },
     tmp: { files: tmpCount, maxAgeMins: TMP_MAX_AGE / 60000 },
     memory: {
@@ -205,25 +149,19 @@ router.get("/health", (_req: Request, res: Response) => {
 router.post("/extract", async (req: Request, res: Response) => {
   const { url } = (req.body as { url?: string }) || {};
 
-  if (!url || typeof url !== "string") {
+  if (!url || typeof url !== "string")
     return void res.json({ success: false, error: "الرجاء إدخال رابط صالح" });
-  }
-  if (url.length > 2048) {
+  if (url.length > 2048)
     return void res.json({ success: false, error: "الرابط طويل جداً" });
-  }
-  if (!isAllowedSourceUrl(url)) {
-    return void res.json({
-      success: false,
-      error: "الرابط غير مدعوم — يُدعم: يوتيوب، تيك توك، إنستغرام، تويتر",
-    });
-  }
+  if (!isAllowedSourceUrl(url))
+    return void res.json({ success: false, error: "الرابط غير مدعوم — يُدعم: يوتيوب، تيك توك، إنستغرام، تويتر" });
 
   try {
     const args = [
       url,
       "--dump-single-json",
       "--no-playlist",
-      "--extractor-args", "youtube:player_client=android,web",
+      "--extractor-args", "youtube:player_client=android,ios",
       "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "--no-warnings",
       "--no-check-certificates",
@@ -232,45 +170,45 @@ router.post("/extract", async (req: Request, res: Response) => {
 
     const stdout = await runYtDlp(args, 30_000);
     const info = JSON.parse(stdout) as Record<string, unknown>;
-
-    if (!info) {
-      return void res.json({ success: false, error: "لم يتم الحصول على معلومات الفيديو" });
-    }
+    if (!info) return void res.json({ success: false, error: "لم يتم الحصول على معلومات الفيديو" });
 
     const isPlaylist = info["_type"] === "playlist" || info["_type"] === "multi_video";
 
-    const seen = new Set<number>();
+    // Collect unique heights from ALL video streams (video-only + combined)
+    const seenH = new Set<number>();
     const formats = ((info["formats"] as Array<Record<string, unknown>>) || [])
-      .filter((f) => f["url"] && f["height"] && (f["ext"] === "mp4" || f["vcodec"] !== "none"))
+      .filter((f) => {
+        const h = f["height"] as number;
+        const vcodec = (f["vcodec"] as string) || "";
+        // Keep: has height, has video (vcodec not 'none'), not storyboard
+        return h && h > 0 && vcodec !== "none" && f["ext"] !== "mhtml";
+      })
       .map((f) => ({
-        quality:  f["height"] + "p",
-        height:   f["height"] as number,
-        url:      f["url"] as string,
-        ext:      (f["ext"] as string) || "mp4",
-        filesize: (f["filesize"] as number) || (f["filesize_approx"] as number) || null,
-        vcodec:   (f["vcodec"] as string) || "",
-        acodec:   (f["acodec"] as string) || "",
+        quality:     (f["height"] as number) + "p",
+        height:      f["height"] as number,
+        ext:         (f["ext"] as string) || "mp4",
+        filesize:    (f["filesize"] as number) || (f["filesize_approx"] as number) || null,
+        hasAudio:    (f["acodec"] as string) !== "none",
       }))
       .filter((f) => {
-        if (seen.has(f.height)) return false;
-        seen.add(f.height);
+        if (seenH.has(f.height)) return false;
+        seenH.add(f.height);
         return true;
       })
       .sort((a, b) => b.height - a.height)
-      .slice(0, 6);
+      .slice(0, 8);
 
-    if (!formats.length) {
+    if (!formats.length)
       return void res.json({ success: false, error: "لا توجد صيغ فيديو متاحة لهذا الرابط" });
-    }
 
     return void res.json({
       success:      true,
-      title:        (info["title"] as string)       || "فيديو بدون عنوان",
-      thumbnail:    (info["thumbnail"] as string)   || "",
-      duration:     (info["duration"] as number)    || 0,
-      uploader:     (info["uploader"] as string)    || (info["channel"] as string) || "",
-      viewCount:    (info["view_count"] as number)  || 0,
-      likeCount:    (info["like_count"] as number)  || 0,
+      title:        (info["title"]       as string) || "فيديو بدون عنوان",
+      thumbnail:    (info["thumbnail"]   as string) || "",
+      duration:     (info["duration"]    as number) || 0,
+      uploader:     (info["uploader"]    as string) || (info["channel"] as string) || "",
+      viewCount:    (info["view_count"]  as number) || 0,
+      likeCount:    (info["like_count"]  as number) || 0,
       uploadDate:   (info["upload_date"] as string) || "",
       isPlaylist,
       playlistNote: isPlaylist ? "ملاحظة: تم استخراج الفيديو الأول فقط من القائمة" : null,
@@ -286,40 +224,32 @@ router.post("/extract", async (req: Request, res: Response) => {
 
 // ─── Download ─────────────────────────────────────────────────────────────────
 router.get("/download", async (req: Request, res: Response) => {
-  const { url, originalUrl, filename, mode } = req.query as Record<string, string>;
+  const { originalUrl, filename, mode, height } = req.query as Record<string, string>;
 
-  if (!url || typeof url !== "string") {
-    return void res.status(400).json({ error: "رابط مطلوب" });
-  }
-  if (!isCdnUrl(url)) {
-    return void res.status(403).json({ error: "ممنوع: رابط CDN غير معتمد" });
-  }
+  if (!originalUrl || !isAllowedSourceUrl(originalUrl))
+    return void res.status(400).json({ error: "رابط المصدر غير صالح" });
 
   const name    = safeName(filename);
   const tmpBase = path.join(TMP_DIR, `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
 
   const runDownload = async (): Promise<void> => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 120_000);
-
     try {
-      // ── MP3 mode ─────────────────────────────────────────────────────────
+      // ── MP3 mode ──────────────────────────────────────────────────────────
       if (mode === "mp3") {
-        const srcUrl = originalUrl && isAllowedSourceUrl(originalUrl) ? originalUrl : url;
-        const mp3Path = tmpBase + ".mp3";
-
         await runYtDlp([
-          srcUrl,
+          originalUrl,
           "--extract-audio",
           "--audio-format", "mp3",
           "--audio-quality", "192K",
           "--output", tmpBase + ".%(ext)s",
+          "--extractor-args", "youtube:player_client=android,ios",
           "--user-agent", "Mozilla/5.0",
           "--no-playlist",
           "--no-check-certificates",
           "--no-warnings",
         ], 120_000);
 
+        const mp3Path = tmpBase + ".mp3";
         if (!fs.existsSync(mp3Path)) throw new Error("فشل إنشاء ملف MP3");
 
         const { size } = fs.statSync(mp3Path);
@@ -336,46 +266,64 @@ router.get("/download", async (req: Request, res: Response) => {
         return;
       }
 
-      // ── MP4 mode — direct CDN fetch ───────────────────────────────────────
-      const { default: fetch } = await import("node-fetch");
-      const fetchRes = await fetch(url, {
-        method:  "GET",
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Referer:      "https://www.google.com/",
-          Accept:       "video/mp4,video/*;q=0.9,*/*;q=0.8",
-        },
-        signal: controller.signal as Parameters<typeof fetch>[1] extends { signal?: infer S } ? S : never,
-      });
+      // ── MP4 mode — yt-dlp with ffmpeg merge ───────────────────────────────
+      const h = parseInt(height || "720");
+      const formatSel = [
+        `bestvideo[height=${h}][ext=mp4]+bestaudio[ext=m4a]`,
+        `bestvideo[height=${h}]+bestaudio`,
+        `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]`,
+        `bestvideo[height<=${h}]+bestaudio`,
+        `best[height<=${h}]`,
+        "best",
+      ].join("/");
 
-      if (!fetchRes.ok) throw new Error(`HTTP ${fetchRes.status}`);
+      const outputTemplate = tmpBase + ".%(ext)s";
 
-      res.setHeader("Content-Type",        "video/mp4");
-      res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(name)}.mp4`);
+      await runYtDlp([
+        originalUrl,
+        "--format", formatSel,
+        "--output", outputTemplate,
+        "--merge-output-format", "mp4",
+        "--extractor-args", "youtube:player_client=android,ios",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--no-playlist",
+        "--no-check-certificates",
+        "--no-warnings",
+      ], 180_000);
+
+      // Find the output file (yt-dlp may name it .mp4 or .mkv etc.)
+      let outFile = tmpBase + ".mp4";
+      if (!fs.existsSync(outFile)) {
+        const dir = path.dirname(tmpBase);
+        const prefix = path.basename(tmpBase);
+        const candidates = fs.readdirSync(dir)
+          .filter(f => f.startsWith(prefix))
+          .map(f => path.join(dir, f));
+        if (!candidates.length) throw new Error("فشل إنشاء ملف الفيديو");
+        outFile = candidates[0];
+      }
+
+      const { size } = fs.statSync(outFile);
+      const ext = path.extname(outFile).slice(1) || "mp4";
+      const mime = ext === "mp4" ? "video/mp4" : "video/webm";
+
+      res.setHeader("Content-Type",        mime);
+      res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(name)}.${ext}`);
+      res.setHeader("Content-Length",      size);
       res.setHeader("Cache-Control",       "no-store");
 
-      const cl = fetchRes.headers.get("content-length");
-      if (cl) res.setHeader("Content-Length", cl);
-
-      const nodeStream = Readable.fromWeb
-        ? Readable.fromWeb(fetchRes.body as Parameters<typeof Readable.fromWeb>[0])
-        : (fetchRes.body as unknown as NodeJS.ReadableStream);
-
-      (nodeStream as NodeJS.ReadableStream).pipe(res);
-      (nodeStream as NodeJS.EventEmitter).on("error", (err: Error) => {
-        logger.error({ err }, "Stream error");
-        if (!res.headersSent) res.status(500).end();
-      });
-      res.on("close", () => { if (!res.writableEnded) controller.abort(); });
+      const stream = fs.createReadStream(outFile);
+      stream.pipe(res);
+      const cleanup = () => { try { fs.unlinkSync(outFile); } catch {} };
+      stream.on("end",   cleanup);
+      stream.on("error", () => { cleanup(); if (!res.headersSent) res.status(500).end(); });
 
     } catch (e) {
       cleanupFiles(tmpBase);
-      const msg = (e as Error)?.message?.includes("abort")
+      const msg = (e as Error)?.message?.includes("timeout")
         ? "انتهت مهلة التحميل، حاول مجدداً"
         : fmtError(e);
       if (!res.headersSent) res.status(500).json({ error: msg });
-    } finally {
-      clearTimeout(timer);
     }
   };
 

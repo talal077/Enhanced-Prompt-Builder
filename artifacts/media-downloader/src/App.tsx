@@ -34,11 +34,9 @@ const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 interface Format {
   quality: string;
   height: number;
-  url: string;
   ext: string;
   filesize: number | null;
-  vcodec: string;
-  acodec: string;
+  hasAudio: boolean;
 }
 
 interface Meta {
@@ -240,7 +238,7 @@ export default function App() {
     setDlState({ active: true, progress: 3, done: false });
 
     const params = new URLSearchParams({
-      url: selected.url,
+      height: String(selected.height),
       originalUrl: originalUrlRef.current,
       filename: meta?.title || "media",
       mode,
