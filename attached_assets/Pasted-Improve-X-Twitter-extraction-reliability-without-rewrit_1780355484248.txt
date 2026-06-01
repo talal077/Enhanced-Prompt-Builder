@@ -1,0 +1,73 @@
+Improve X/Twitter extraction reliability without rewriting the whole app.
+
+Requirements:
+
+1. Normalize X/Twitter URLs:
+
+- Convert x.com to twitter.com
+- Convert m.twitter.com to twitter.com
+- Support /i/status/{id}
+- Support /{username}/status/{id}
+- Strip query parameters
+- Strip trailing paths like /photo/1
+- Extract and validate numeric tweet ID
+- Use canonical URL: https://twitter.com/i/status/{tweet_id}
+
+2. Use yt-dlp as the primary extractor.
+
+- Pass the normalized canonical URL to yt-dlp
+- Add retry logic: 3 attempts with short delay
+- Use safer yt-dlp options for Twitter/X
+- Do not add cookies yet
+- Do not add Playwright yet
+- Do not use unofficial internal Twitter APIs yet
+
+3. Improve error handling:
+   Classify yt-dlp errors into:
+
+- PRIVATE_ACCOUNT
+- TWEET_DELETED
+- LOGIN_REQUIRED
+- AGE_RESTRICTED
+- NO_VIDEO
+- RATE_LIMITED
+- NETWORK_ERROR
+- EXTRACTION_FAILED
+
+4. Show Arabic user messages:
+   PRIVATE_ACCOUNT: "هذا الحساب خاص. لا يمكن تحميل فيديوهات الحسابات الخاصة."
+   TWEET_DELETED: "تم حذف التغريدة أو أن الرابط غير صحيح."
+   LOGIN_REQUIRED: "هذا المحتوى يتطلب تسجيل الدخول إلى تويتر."
+   AGE_RESTRICTED: "هذا المحتوى مقيد بالعمر ولا يمكن تحميله."
+   NO_VIDEO: "هذه التغريدة لا تحتوي على فيديو."
+   RATE_LIMITED: "تم الوصول للحد المسموح. الرجاء المحاولة بعد قليل."
+   NETWORK_ERROR: "خطأ في الاتصال. تحقق من اتصالك بالإنترنت."
+   EXTRACTION_FAILED: "تعذر استخراج الفيديو من X/Twitter. قد يكون المقطع خاصًا أو يحتاج تسجيل دخول أو غير مدعوم."
+
+5. Add structured server logs:
+
+- timestamp
+- original_url
+- normalized_url
+- tweet_id
+- platform
+- success true/false
+- error_type
+- response_time_ms
+
+6. Keep YouTube, TikTok, Instagram, and existing MP3/MP4 behavior unchanged.
+
+7. Keep the current UI design unchanged.
+
+8. Add server-side logging for the original URL, normalized URL, platform, and extraction error.
+
+9. Before making changes, create a safe checkpoint/commit.
+
+10. After changes:
+
+- Test with x.com/i/status links.
+- Test with twitter.com/status links.
+- Test at least one successful X video.
+- Test one failed/private/unsupported X link.
+
+11. Do not publish automatically until I review the app in Preview.
