@@ -1,7 +1,8 @@
 {
+  "id": "/",
   "name": "Media Downloader",
   "short_name": "Downloader",
-  "description": "Download videos and audio from supported platforms.",
+  "description": "حمّل الفيديوهات والصوت من يوتيوب، تيك توك، إنستغرام، وتويتر.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -1,4 +1,4 @@
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v2";
 const SHELL_CACHE   = "app-shell-" + CACHE_VERSION;
 const OFFLINE_URL   = "/offline.html";
 
@@ -6,7 +6,7 @@ const OFFLINE_URL   = "/offline.html";
 const SHELL_ASSETS = [
   "/",
   "/offline.html",
-  "/manifest.webmanifest",
+  "/manifest.json",
   "/icons/icon-192.png",
   "/icons/icon-512.png",
 ];
@@ -57,7 +57,7 @@ self.addEventListener("fetch", (event) => {
   if (request.mode === "navigate") {
     event.respondWith(
       fetch(request)
-        .catch(() => caches.match(OFFLINE_URL))
+        .catch(() => caches.match(OFFLINE_URL).then((r) => r || new Response("Offline", { status: 503 })))
     );
     return;
   }
@@ -72,7 +72,7 @@ self.addEventListener("fetch", (event) => {
         if (
           response.ok &&
           response.type === "basic" &&
-          (url.pathname.match(/\.(js|css|png|svg|ico|woff2?|ttf)$/) ||
+          (url.pathname.match(/\.(js|css|png|svg|ico|woff2?|ttf|json)$/) ||
            url.pathname === "/")
         ) {
           const toCache = response.clone();
