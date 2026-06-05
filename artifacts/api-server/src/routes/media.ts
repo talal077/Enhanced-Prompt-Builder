@@ -169,6 +169,26 @@ function detectPlatform(url: string): Platform {
   return "unknown";
 }
 
+// ─── YouTube URL Cleaner ──────────────────────────────────────────────────────
+// Strip playlist/mix params so YouTube doesn't trigger stricter bot checks
+// for playlist-context API calls.  Only the video ID is needed.
+function cleanYouTubeUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.replace(/^(www\.|m\.)/, "").toLowerCase();
+    if (host === "youtube.com") {
+      const vid = u.searchParams.get("v");
+      if (vid) return `https://www.youtube.com/watch?v=${vid}`;
+    }
+    if (host === "youtu.be") {
+      // https://youtu.be/<id>?si=...
+      const vid = u.pathname.replace(/^\//, "").split("/")[0];
+      if (vid) return `https://www.youtube.com/watch?v=${vid}`;
+    }
+  } catch {}
+  return raw;
+}
+
 // ─── Platform-specific yt-dlp args ───────────────────────────────────────────
 const UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const UA_MOBILE  = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
@@ -177,9 +197,13 @@ function extractArgs(platform: Platform): string[] {
   const base = ["--no-warnings", "--no-check-certificates", "--no-playlist"];
   switch (platform) {
     case "youtube":
+      // ios client avoids YouTube's bot-detection on server IPs (uses a
+      // different API path).  android_vr / android follow as richer fallbacks
+      // (DASH up to 4K).  yt-dlp tries each in order and merges results; if
+      // one client is rejected the others still contribute their formats.
       return [
         ...base,
-        "--extractor-args", "youtube:player_client=android_vr,android",
+        "--extractor-args", "youtube:player_client=ios,android_vr,android",
         "--user-agent", UA_DESKTOP,
         "--socket-timeout", "20",
       ];
@@ -223,12 +247,17 @@ function downloadFormatSel(platform: Platform, height: number): string {
       "best",
     ].join("/");
   }
+  // Note: ios player client returns m3u8 (HLS) streams with ext=mp4.
+  // The merged selectors cover both DASH (android_vr) and HLS (ios).
+  // The final "best" catches any remaining progressive or merged streams.
   return [
     `bestvideo[height=${height}][ext=mp4]+bestaudio[ext=m4a]`,
     `bestvideo[height=${height}]+bestaudio`,
     `bestvideo[height<=${height}][ext=mp4]+bestaudio[ext=m4a]`,
     `bestvideo[height<=${height}]+bestaudio`,
+    `best[height<=${height}][ext=mp4]`,
     `best[height<=${height}]`,
+    `best[ext=mp4]`,
     "best",
   ].join("/");
 }
@@ -274,8 +303,13 @@ function cleanupFiles(base: string): void {
 
 function fmtError(e: unknown): string {
   const msg = String((e as Error)?.message || e || "");
+  // ── YouTube bot / anti-bot detection ──────────────────────────────────────
+  // Must be checked BEFORE the generic "cookies" and "sign in" checks because
+  // YouTube's bot rejection message contains both words.
+  if (/confirm.{0,30}not a bot|bot.{0,30}confirm/i.test(msg))
+    return "يوتيوب اكتشف أن الطلب آلي. انتظر دقيقة ثم أعد المحاولة";
+  // ── Generic errors ────────────────────────────────────────────────────────
   if (msg.includes("timeout"))                         return "انتهت مهلة الطلب، حاول مجدداً";
-  if (msg.includes("cookies"))                         return "المحتوى خاص أو يتطلب تسجيل دخول";
   if (/private/i.test(msg))                            return "هذا الفيديو خاص ولا يمكن تحميله";
   if (msg.includes("not available in your country"))   return "الفيديو غير متاح في منطقتك";
   if (msg.includes("Unable to extract webpage video")) return "تيك توك يحجب الطلب مؤقتاً، أعد المحاولة لاحقاً";
@@ -283,7 +317,8 @@ function fmtError(e: unknown): string {
   if (/removed|deleted/i.test(msg))                    return "تم حذف هذا الفيديو";
   if (msg.includes("HTTP Error 403"))                  return "الوصول مرفوض، أعد الجلب";
   if (msg.includes("HTTP Error 404"))                  return "الفيديو غير موجود";
-  if (/sign.?in|login/i.test(msg))                     return "هذا الفيديو يتطلب تسجيل دخول";
+  if (/sign.?in|login/i.test(msg) || msg.includes("cookies"))
+                                                       return "هذا الفيديو يتطلب تسجيل دخول";
   if (/geo.?restrict|region/i.test(msg))               return "الفيديو مقيّد جغرافياً";
   if (msg.includes("Unable to extract"))               return "تعذّر استخراج الفيديو، حاول مجدداً بعد قليل";
   return "فشل استخراج الفيديو، تحقق من الرابط وحاول مجدداً";
@@ -384,6 +419,11 @@ router.post("/extract", async (req: Request, res: Response) => {
     }
 
     const platform = detectPlatform(resolvedUrl);
+
+    // Strip YouTube playlist/mix params — cleaner URL reduces bot-check risk
+    if (platform === "youtube") {
+      resolvedUrl = cleanYouTubeUrl(resolvedUrl);
+    }
 
     logger.info({
       event:          "extract_start",
